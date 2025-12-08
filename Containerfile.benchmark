@@ -1,0 +1,79 @@
+# Containerfile for running sqlite_sexp benchmarks
+#
+# Build:
+#   podman build -f Containerfile.benchmark -t sqlite_sexp:benchmark .
+#
+# Run benchmarks:
+#   podman run --rm sqlite_sexp:benchmark
+#
+# Run specific benchmark:
+#   podman run --rm sqlite_sexp:benchmark basic
+#   podman run --rm sqlite_sexp:benchmark ocsf
+
+FROM alpine:3.23
+
+# Install build dependencies
+# Alpine 3.23 has SQLite 3.51.1 with full JSONB support
+RUN apk add --no-cache \
+    build-base \
+    sqlite \
+    sqlite-dev \
+    python3
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code
+COPY src/ ./src/
+COPY test/ ./test/
+COPY Makefile ./
+
+# Build optimized version
+RUN make clean && make
+
+# Create benchmark runner script
+RUN cat > /app/run_benchmark.sh << 'SCRIPT'
+#!/bin/sh
+set -e
+
+MODE="${1:-all}"
+
+run_basic_benchmark() {
+    echo "=========================================="
+    echo "Running basic benchmark..."
+    echo "=========================================="
+    echo "SQLite version: $(sqlite3 --version)"
+    sqlite3 < test/benchmark.sql
+}
+
+run_ocsf_benchmark() {
+    echo "=========================================="
+    echo "Running OCSF benchmark (100k rows)..."
+    echo "=========================================="
+    echo "SQLite version: $(sqlite3 --version)"
+    sqlite3 < test/benchmark_ocsf.sql
+}
+
+case "$MODE" in
+    basic)
+        run_basic_benchmark
+        ;;
+    ocsf)
+        run_ocsf_benchmark
+        ;;
+    all)
+        run_basic_benchmark
+        echo ""
+        run_ocsf_benchmark
+        ;;
+    *)
+        echo "Usage: $0 {basic|ocsf|all}"
+        exit 1
+        ;;
+esac
+SCRIPT
+
+RUN chmod +x /app/run_benchmark.sh
+
+ENTRYPOINT ["/app/run_benchmark.sh"]
+CMD ["all"]

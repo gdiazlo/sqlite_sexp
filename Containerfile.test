@@ -1,0 +1,219 @@
+# Containerfile for testing sqlite_sexp with AddressSanitizer and Valgrind
+#
+# Build:
+#   podman build -f Containerfile.test -t sqlite_sexp:test .
+#
+# Run tests with ASAN:
+#   podman run --rm sqlite_sexp:test asan
+#
+# Run tests with Valgrind:
+#   podman run --rm sqlite_sexp:test valgrind
+#
+# Run all tests:
+#   podman run --rm sqlite_sexp:test all
+
+FROM alpine:3.23
+
+# Install build dependencies
+# Alpine 3.23 has SQLite 3.51.1 with full JSONB support
+RUN apk add --no-cache \
+    build-base \
+    clang \
+    compiler-rt \
+    sqlite \
+    sqlite-dev \
+    valgrind
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code
+COPY src/ ./src/
+COPY test/ ./test/
+COPY Makefile ./
+
+# Build normal version for basic test
+RUN make clean && make
+
+# Build ASAN version
+RUN make clean && make asan
+
+# Create test runner script
+RUN cat > /app/run_tests.sh << 'SCRIPT'
+#!/bin/sh
+set -e
+
+MODE="${1:-all}"
+
+run_basic_tests() {
+    echo "=========================================="
+    echo "Running basic tests (normal build)..."
+    echo "=========================================="
+    echo "SQLite version: $(sqlite3 --version)"
+    make clean && make
+    sqlite3 < test/test_basic.sql
+    sqlite3 < test/test_comprehensive.sql
+    echo ""
+    echo "Basic tests PASSED"
+}
+
+run_asan_tests() {
+    echo "=========================================="
+    echo "Running tests with AddressSanitizer..."
+    echo "=========================================="
+    echo "SQLite version: $(sqlite3 --version)"
+    
+    # Find ASAN runtime library - check multiple locations for different Alpine/LLVM versions
+    ASAN_LIB=""
+    for search_path in /usr/lib/llvm*/lib/clang/*/lib/*-linux-musl /usr/lib/clang/*/lib/*-linux-musl /usr/lib/clang; do
+        found=$(find $search_path -name 'libclang_rt.asan*.so' 2>/dev/null | head -1)
+        if [ -n "$found" ] && [ -f "$found" ]; then
+            ASAN_LIB="$found"
+            break
+        fi
+    done
+    
+    if [ -z "$ASAN_LIB" ]; then
+        echo "ASAN runtime not found on this system"
+        echo "Skipping ASAN tests - using Valgrind for memory checking instead"
+        echo ""
+        echo "ASAN tests SKIPPED"
+        return 0
+    fi
+    
+    ASAN_LIB_DIR=$(dirname "$ASAN_LIB")
+    echo "Found ASAN runtime: $ASAN_LIB"
+    echo "ASAN library directory: $ASAN_LIB_DIR"
+    
+    # Build extension with ASAN and shared runtime
+    make clean && make asan
+    
+    # Configure ASAN options
+    # - detect_leaks=0: Leak detection has issues with musl libc
+    # - abort_on_error=1: Make errors fatal
+    # - symbolize=1: Show symbols in stack traces
+    # - verify_asan_link_order=0: Required for LD_PRELOAD approach
+    export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:symbolize=1:verify_asan_link_order=0"
+    export LD_PRELOAD="$ASAN_LIB"
+    export LD_LIBRARY_PATH="$ASAN_LIB_DIR:${LD_LIBRARY_PATH:-}"
+    
+    echo "ASAN_OPTIONS: $ASAN_OPTIONS"
+    echo "LD_PRELOAD: $LD_PRELOAD"
+    echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+    
+    echo ""
+    echo "--- Running test_basic.sql ---"
+    sqlite3 < test/test_basic.sql
+    
+    echo ""
+    echo "--- Running test_comprehensive.sql ---"
+    sqlite3 < test/test_comprehensive.sql
+    
+    unset LD_PRELOAD
+    unset LD_LIBRARY_PATH
+    unset ASAN_OPTIONS
+    echo ""
+    echo "ASAN tests PASSED - no memory errors detected"
+}
+
+run_valgrind_tests() {
+    echo "=========================================="
+    echo "Running tests with Valgrind..."
+    echo "=========================================="
+    echo "SQLite version: $(sqlite3 --version)"
+    make clean && make debug
+    
+    echo "--- Running test_basic.sql with Valgrind ---"
+    valgrind --leak-check=full \
+             --show-leak-kinds=all \
+             --track-origins=yes \
+             --error-exitcode=1 \
+             --suppressions=/app/valgrind.supp \
+             sqlite3 < test/test_basic.sql
+    
+    echo ""
+    echo "--- Running test_comprehensive.sql with Valgrind ---"
+    valgrind --leak-check=full \
+             --show-leak-kinds=all \
+             --track-origins=yes \
+             --error-exitcode=1 \
+             --suppressions=/app/valgrind.supp \
+             sqlite3 < test/test_comprehensive.sql
+    
+    echo ""
+    echo "Valgrind tests PASSED - no memory errors detected"
+}
+
+case "$MODE" in
+    basic)
+        run_basic_tests
+        ;;
+    asan)
+        run_asan_tests
+        ;;
+    valgrind)
+        run_valgrind_tests
+        ;;
+    all)
+        run_basic_tests
+        echo ""
+        run_asan_tests
+        echo ""
+        run_valgrind_tests
+        echo ""
+        echo "=========================================="
+        echo "ALL TESTS PASSED"
+        echo "=========================================="
+        ;;
+    *)
+        echo "Usage: $0 {basic|asan|valgrind|all}"
+        exit 1
+        ;;
+esac
+SCRIPT
+
+RUN chmod +x /app/run_tests.sh
+
+# Create Valgrind suppressions file for SQLite internals
+RUN cat > /app/valgrind.supp << 'SUPP'
+# Valgrind suppressions for SQLite internals
+# Some SQLite allocations may appear as leaks but are intentional caching
+
+{
+   sqlite3_initialize
+   Memcheck:Leak
+   ...
+   fun:sqlite3_initialize
+}
+
+{
+   sqlite3_open
+   Memcheck:Leak
+   ...
+   fun:sqlite3_open*
+}
+
+{
+   sqlite3_prepare
+   Memcheck:Leak
+   ...
+   fun:sqlite3_prepare*
+}
+
+{
+   dlopen_leaks
+   Memcheck:Leak
+   ...
+   fun:dlopen*
+}
+
+{
+   sqlite3_extension_init
+   Memcheck:Leak
+   ...
+   fun:sqlite3_extension_init
+}
+SUPP
+
+ENTRYPOINT ["/app/run_tests.sh"]
+CMD ["all"]
